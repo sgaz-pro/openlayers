@@ -169,6 +169,12 @@ class VectorStyleRenderer extends Disposable {
     this.styles = styles;
 
     /**
+     * @type {boolean}
+     * @private
+     */
+    this.hasText_ = hasTextStyle(styles);
+
+    /**
      * @type {AttributeDefinitions}
      * @private
      */
@@ -429,6 +435,29 @@ class VectorStyleRenderer extends Disposable {
       invertVerticesTransform: invertVerticesTransform,
       textInstructionsKey,
     };
+  }
+
+  /**
+   * Generate (or refresh) text instructions without rebuilding WebGL buffers.
+   * @param {import('./MixedGeometryBatch.js').default} geometryBatch Geometry batch
+   * @param {import("../../transform.js").Transform} transform Transform to apply to coordinates
+   * @return {Promise<string>|null} Resolves to a key corresponding to the text draw instructions; null if no text to render
+   */
+  generateTextInstructionsOnly(geometryBatch, transform) {
+    if (!this.hasText_ || geometryBatch.isEmpty()) {
+      return null;
+    }
+    const labelsArray = new LabelsArray();
+    const renderInstructions = this.generateRenderInstructions_(
+      geometryBatch,
+      labelsArray,
+      transform,
+    );
+    return this.generateTextInstructions_(
+      renderInstructions,
+      labelsArray,
+      transform,
+    );
   }
 
   /**
@@ -894,6 +923,29 @@ class VectorStyleRenderer extends Disposable {
   }
 
   /**
+   * @return {boolean} Whether the style contains text.
+   */
+  hasText() {
+    return this.hasText_;
+  }
+
+  /**
+   * Clear the text overlay canvas and reset its frame state.
+   */
+  clearTextOverlay() {
+    const context = this.textOverlayCanvas_.getContext('2d');
+    if (context) {
+      context.clearRect(
+        0,
+        0,
+        this.textOverlayCanvas_.width,
+        this.textOverlayCanvas_.height,
+      );
+    }
+    this.textOverlayRenderFrameState_ = null;
+  }
+
+  /**
    * Dispose of text instructions in worker.
    * @param {string} key Key corresponding to the instructions set to dispose
    */
@@ -915,6 +967,50 @@ class VectorStyleRenderer extends Disposable {
 }
 
 export default VectorStyleRenderer;
+
+/**
+ * @param {FlatStyleLike|StyleShaders|Array<StyleShaders>} styles Styles to inspect.
+ * @return {boolean} Whether any text style properties are present.
+ */
+function hasTextStyle(styles) {
+  if (!styles) {
+    return false;
+  }
+  if (Array.isArray(styles)) {
+    for (let i = 0; i < styles.length; i++) {
+      const entry = styles[i];
+      if (!entry) {
+        continue;
+      }
+      if (typeof entry === 'object' && 'style' in entry) {
+        if (hasTextStyle(entry.style)) {
+          return true;
+        }
+        continue;
+      }
+      if (typeof entry === 'object' && 'sourceRule' in entry) {
+        const rule = entry.sourceRule;
+        if (rule && 'style' in rule && hasTextStyle(rule.style)) {
+          return true;
+        }
+        continue;
+      }
+      if (hasTextStyle(entry)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (typeof styles !== 'object') {
+    return false;
+  }
+  for (const key in styles) {
+    if (key.startsWith('text-')) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Breaks down a vector style into an array of prebuilt shader builders with attributes and uniforms

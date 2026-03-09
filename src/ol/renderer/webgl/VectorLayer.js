@@ -31,6 +31,7 @@ import {
 } from '../../vec/mat4.js';
 import {DefaultUniform} from '../../webgl/Helper.js';
 import WebGLRenderTarget from '../../webgl/RenderTarget.js';
+import {getUid} from '../../util.js';
 import WebGLLayerRenderer from './Layer.js';
 import {getWorldParameters} from './worldUtil.js';
 
@@ -42,6 +43,10 @@ export const Uniforms = {
   TEXT_OVERLAY_TEXTURE: 'u_textOverlay',
   TEXT_OVERLAY_MATRIX: 'u_textOverlayMatrix',
 };
+
+const DEFAULT_TEXT_REBUILD_THROTTLE_MS = 120;
+const DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS = 48;
+const TEXT_REBUILD_VISIBILITY_PADDING_CLIP = 0.2;
 
 /**
  * @typedef {import('../../render/webgl/VectorStyleRenderer.js').StyleShaders} StyleShaders
@@ -116,11 +121,6 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     /**
      * @private
      */
-    this.sourceRevision_ = -1;
-
-    /**
-     * @private
-     */
     this.previousExtent_ = createEmpty();
 
     /**
@@ -152,6 +152,113 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     this.currentFrameStateTransform_ = createTransform();
 
     /**
+     * Transform that was used when generating the current buffers.
+     * Used for fast point coordinate updates without a full rebuild.
+     * @type {import("../../transform.js").Transform}
+     * @private
+     */
+    this.renderTransform_ = createTransform();
+
+    /**
+     * Tracks the last known geometry revision per feature uid.
+     * @type {Map<string, number>}
+     * @private
+     */
+    this.geometryRevisionByUid_ = new Map();
+
+    /**
+     * Uids of point features whose coordinates changed since the last render.
+     * @type {Set<string>}
+     * @private
+     */
+    this.dirtyPointUids_ = new Set();
+
+    /**
+     * Maps feature uid to point instance index or indices in the point instance buffer.
+     * @type {Map<string, number|Array<number>>}
+     * @private
+     */
+    this.pointInstanceIndexByUid_ = new Map();
+
+    /**
+     * Stride of a point instance in floats.
+     * @type {number}
+     * @private
+     */
+    this.pointInstanceStride_ = 0;
+
+    /**
+     * Minimum interval between text instruction rebuilds during point animation.
+     * @type {number}
+     * @private
+     */
+    this.textRenderThrottleMs_ = DEFAULT_TEXT_REBUILD_THROTTLE_MS;
+
+    /**
+     * Minimum interval between text overlay renders.
+     * @type {number}
+     * @private
+     */
+    this.textOverlayRenderThrottleMs_ =
+      DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS;
+
+    /**
+     * Whether a throttled text instruction rebuild is needed.
+     * @type {boolean}
+     * @private
+     */
+    this.textRebuildNeeded_ = false;
+
+    /**
+     * Whether a throttled text instruction rebuild is in flight.
+     * @type {boolean}
+     * @private
+     */
+    this.textRebuildInFlight_ = false;
+
+    /**
+     * Whether another text rebuild was requested while one was in flight.
+     * @type {boolean}
+     * @private
+     */
+    this.textRebuildQueued_ = false;
+
+    /**
+     * Last time text instructions were rebuilt.
+     * @type {number}
+     * @private
+     */
+    this.lastTextRenderTime_ = -Infinity;
+
+    /**
+     * Last time the overlay canvas was rendered.
+     * @type {number}
+     * @private
+     */
+    this.lastTextOverlayRenderTime_ = -Infinity;
+
+    /**
+     * Monotonic counter used to discard outdated text rebuild results.
+     * @type {number}
+     * @private
+     */
+    this.textRebuildGeneration_ = 0;
+
+    /**
+     * Timeout id for delayed text rebuild scheduling.
+     * @type {number}
+     * @private
+     */
+    this.textRebuildTimerId_ = 0;
+
+    /**
+     * Last text instructions key rendered to the overlay.
+     * @type {string|null}
+     * @private
+     */
+    this.lastRenderedTextInstructionsKey_ = null;
+
+    /**
      * @type {import('../../style/flat.js').StyleVariables}
      * @private
      */
@@ -174,6 +281,41 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
      * @private
      */
     this.buffers_ = null;
+
+    /**
+     * Monotonic counter used to invalidate outdated async buffer generations.
+     * @type {number}
+     * @private
+     */
+    this.bufferGeneration_ = 0;
+
+    /**
+     * Non-zero while a full buffer generation is in flight.
+     * @type {number}
+     * @private
+     */
+    this.bufferGenerationInFlight_ = 0;
+
+    /**
+     * Whether a full rebuild is needed.
+     * @type {boolean}
+     * @private
+     */
+    this.rebuildNeeded_ = false;
+
+    /**
+     * Whether a rebuild was requested while another generation was in flight.
+     * @type {boolean}
+     * @private
+     */
+    this.rebuildQueued_ = false;
+
+    /**
+     * Text instruction keys pending disposal after the next successful overlay render.
+     * @type {Array<string>}
+     * @private
+     */
+    this.pendingTextInstructions_ = [];
 
     /**
      * @private
@@ -211,6 +353,13 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     }
     const features = source.getFeatures();
     this.batch_.addFeatures(features, projectionTransform);
+    for (let i = 0; i < features.length; i++) {
+      const feature = features[i];
+      const geometry = feature.getGeometry?.();
+      if (geometry) {
+        this.geometryRevisionByUid_.set(getUid(feature), geometry.getRevision());
+      }
+    }
     this.sourceListenKeys_ = [
       listen(
         source,
@@ -295,6 +444,11 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   handleSourceFeatureAdded_(projectionTransform, event) {
     const feature = event.feature;
     this.batch_.addFeature(feature, projectionTransform);
+    const geometry = feature.getGeometry?.();
+    if (geometry) {
+      this.geometryRevisionByUid_.set(getUid(feature), geometry.getRevision());
+    }
+    this.requestRebuild_();
   }
 
   /**
@@ -304,7 +458,45 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
    */
   handleSourceFeatureChanged_(projectionTransform, event) {
     const feature = event.feature;
+    const uid = getUid(feature);
+    const geometry = feature.getGeometry?.();
+    const geometryRevision = geometry ? geometry.getRevision() : -1;
+    const previousRevision = this.geometryRevisionByUid_.get(uid);
+    const geometryChanged =
+      previousRevision === undefined || previousRevision !== geometryRevision;
+
+    if (geometryChanged) {
+      this.geometryRevisionByUid_.set(uid, geometryRevision);
+    }
+
+    if (
+      geometryChanged &&
+      !projectionTransform &&
+      geometry &&
+      geometry.getType() === 'Point' &&
+      this.buffers_?.pointBuffers &&
+      this.pointInstanceStride_ > 0 &&
+      this.pointInstanceIndexByUid_.has(uid)
+    ) {
+      const pointGeometry =
+        /** @type {import("../../geom/Point.js").default} */ (geometry);
+      const batchEntry = this.batch_.pointBatch.entries[uid];
+      if (batchEntry?.flatCoordss?.[0] === pointGeometry.getFlatCoordinates()) {
+        this.dirtyPointUids_.add(uid);
+        if (
+          this.buffers_?.textInstructionsKey &&
+          this.isPointPotentiallyVisibleForText_(
+            pointGeometry.getFlatCoordinates(),
+          )
+        ) {
+          this.textRebuildNeeded_ = true;
+        }
+        return;
+      }
+    }
+
     this.batch_.changeFeature(feature, projectionTransform);
+    this.requestRebuild_(false);
   }
 
   /**
@@ -314,6 +506,11 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   handleSourceFeatureDelete_(event) {
     const feature = event.feature;
     this.batch_.removeFeature(feature);
+    const uid = getUid(feature);
+    this.geometryRevisionByUid_.delete(uid);
+    this.dirtyPointUids_.delete(uid);
+    this.pointInstanceIndexByUid_.delete(uid);
+    this.requestRebuild_();
   }
 
   /**
@@ -321,6 +518,345 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
    */
   handleSourceFeatureClear_() {
     this.batch_.clear();
+    this.geometryRevisionByUid_.clear();
+    this.dirtyPointUids_.clear();
+    this.pointInstanceIndexByUid_.clear();
+    this.pointInstanceStride_ = 0;
+    this.textRebuildNeeded_ = false;
+    this.textRebuildQueued_ = false;
+    this.requestRebuild_();
+  }
+
+  /**
+   * Request a full buffer rebuild. If a generation is already in flight, it can
+   * be invalidated so outdated buffers are dropped when ready.
+   * @param {boolean} [invalidateInFlight] Whether to invalidate the in-flight generation.
+   * @private
+   */
+  requestRebuild_(invalidateInFlight = true) {
+    if (this.bufferGenerationInFlight_) {
+      if (invalidateInFlight && !this.rebuildQueued_) {
+        this.bufferGeneration_++;
+      }
+      this.rebuildQueued_ = true;
+      this.rebuildNeeded_ = false;
+      return;
+    }
+    this.rebuildNeeded_ = true;
+  }
+
+  /**
+   * Rebuild the mapping between feature uids and point instance indices in the
+   * current point instance attributes buffer.
+   * @private
+   */
+  rebuildPointInstanceIndex_() {
+    this.pointInstanceIndexByUid_.clear();
+    this.pointInstanceStride_ = 0;
+    if (!this.buffers_?.pointBuffers) {
+      return;
+    }
+
+    const instanceAttributesBuffer = this.buffers_.pointBuffers[2];
+    const pointCount = this.batch_.pointBatch.geometriesCount;
+    if (!pointCount) {
+      return;
+    }
+
+    const stride = instanceAttributesBuffer.getSize() / pointCount;
+    if (!Number.isFinite(stride) || !Number.isInteger(stride) || stride < 2) {
+      return;
+    }
+    this.pointInstanceStride_ = stride;
+
+    let instanceIndex = 0;
+    const entries = this.batch_.pointBatch.entries;
+    for (const uid in entries) {
+      const entry = entries[uid];
+      const geometriesCount = entry.flatCoordss.length;
+      if (geometriesCount === 1) {
+        this.pointInstanceIndexByUid_.set(uid, instanceIndex++);
+        continue;
+      }
+      const indices = new Array(geometriesCount);
+      for (let i = 0; i < geometriesCount; i++) {
+        indices[i] = instanceIndex++;
+      }
+      this.pointInstanceIndexByUid_.set(uid, indices);
+    }
+  }
+
+  /**
+   * Apply pending point coordinate updates by updating the point instance
+   * attributes buffer in place.
+   * @param {WebGLRenderingContext} gl WebGL context.
+   * @private
+   */
+  flushPointUpdates_(gl) {
+    if (
+      !this.dirtyPointUids_.size ||
+      !this.buffers_?.pointBuffers ||
+      !this.pointInstanceStride_
+    ) {
+      return;
+    }
+
+    const instanceAttributesBuffer = this.buffers_.pointBuffers[2];
+    const array = /** @type {Float32Array|null} */ (
+      instanceAttributesBuffer.getArray()
+    );
+    if (!array) {
+      return;
+    }
+
+    const transform = this.renderTransform_;
+    let minInstance = Infinity;
+    let maxInstance = -Infinity;
+    const stride = this.pointInstanceStride_;
+
+    for (const uid of this.dirtyPointUids_) {
+      const entry = this.batch_.pointBatch.entries[uid];
+      if (!entry) {
+        continue;
+      }
+      const indices = this.pointInstanceIndexByUid_.get(uid);
+      if (indices === undefined) {
+        continue;
+      }
+
+      if (typeof indices === 'number') {
+        const coords = entry.flatCoordss[0];
+        const x = coords[0];
+        const y = coords[1];
+        const px = transform[0] * x + transform[2] * y + transform[4];
+        const py = transform[1] * x + transform[3] * y + transform[5];
+        const offset = indices * stride;
+        array[offset] = px;
+        array[offset + 1] = py;
+        if (indices < minInstance) {
+          minInstance = indices;
+        }
+        if (indices > maxInstance) {
+          maxInstance = indices;
+        }
+        continue;
+      }
+
+      for (let i = 0; i < indices.length; i++) {
+        const index = indices[i];
+        const coords = entry.flatCoordss[i];
+        const x = coords[0];
+        const y = coords[1];
+        const px = transform[0] * x + transform[2] * y + transform[4];
+        const py = transform[1] * x + transform[3] * y + transform[5];
+        const offset = index * stride;
+        array[offset] = px;
+        array[offset + 1] = py;
+        if (index < minInstance) {
+          minInstance = index;
+        }
+        if (index > maxInstance) {
+          maxInstance = index;
+        }
+      }
+    }
+
+    this.dirtyPointUids_.clear();
+
+    if (!Number.isFinite(minInstance) || !Number.isFinite(maxInstance)) {
+      return;
+    }
+
+    const start = minInstance * stride;
+    const end = (maxInstance + 1) * stride;
+    this.helper.bindBuffer(instanceAttributesBuffer);
+    gl.bufferSubData(
+      instanceAttributesBuffer.getType(),
+      start * Float32Array.BYTES_PER_ELEMENT,
+      array.subarray(start, end),
+    );
+  }
+
+  /**
+   * Check whether a point can contribute to text rendering for the current view.
+   * @param {Array<number>} flatCoordinates Point flat coordinates.
+   * @return {boolean} Whether the point is potentially visible for text rendering.
+   * @private
+   */
+  isPointPotentiallyVisibleForText_(flatCoordinates) {
+    if (!flatCoordinates || flatCoordinates.length < 2) {
+      return false;
+    }
+    const transform = this.renderTransform_;
+    const clipX =
+      transform[0] * flatCoordinates[0] +
+      transform[2] * flatCoordinates[1] +
+      transform[4];
+    const clipY =
+      transform[1] * flatCoordinates[0] +
+      transform[3] * flatCoordinates[1] +
+      transform[5];
+    if (!Number.isFinite(clipX) || !Number.isFinite(clipY)) {
+      return true;
+    }
+    const min = -1 - TEXT_REBUILD_VISIBILITY_PADDING_CLIP;
+    const max = 1 + TEXT_REBUILD_VISIBILITY_PADDING_CLIP;
+    return clipX >= min && clipX <= max && clipY >= min && clipY <= max;
+  }
+
+  /**
+   * Throttled refresh of text instructions for animated points.
+   * @param {import("../../Map.js").FrameState} frameState Frame state.
+   * @private
+   */
+  maybeRebuildTextInstructions_(frameState) {
+    if (
+      !this.textRebuildNeeded_ ||
+      !this.styleRenderer_ ||
+      !this.buffers_ ||
+      !this.textRenderThrottleMs_
+    ) {
+      return;
+    }
+
+    if (this.textRebuildInFlight_ || this.bufferGenerationInFlight_) {
+      this.textRebuildQueued_ = true;
+      return;
+    }
+
+    const now = frameState.time;
+    if (now - this.lastTextRenderTime_ < this.textRenderThrottleMs_) {
+      if (!this.textRebuildTimerId_) {
+        const delay =
+          this.textRenderThrottleMs_ - (now - this.lastTextRenderTime_);
+        this.textRebuildTimerId_ = setTimeout(() => {
+          this.textRebuildTimerId_ = 0;
+          if (this.textRebuildNeeded_) {
+            this.getLayer().changed();
+          }
+        }, delay);
+      }
+      return;
+    }
+
+    if (this.textRebuildTimerId_) {
+      clearTimeout(this.textRebuildTimerId_);
+      this.textRebuildTimerId_ = 0;
+    }
+
+    this.textRebuildInFlight_ = true;
+    this.textRebuildNeeded_ = false;
+    this.lastTextRenderTime_ = now;
+
+    const generation = ++this.textRebuildGeneration_;
+    const buffersRef = this.buffers_;
+    const transform = this.helper.makeProjectionTransform(
+      frameState,
+      createTransform(),
+    );
+    const rebuildPromise = this.styleRenderer_.generateTextInstructionsOnly(
+      this.batch_,
+      transform,
+    );
+    if (!rebuildPromise) {
+      this.textRebuildInFlight_ = false;
+      return;
+    }
+
+    rebuildPromise.then((textInstructionsKey) => {
+      this.textRebuildInFlight_ = false;
+
+      if (generation !== this.textRebuildGeneration_) {
+        if (textInstructionsKey) {
+          this.styleRenderer_.disposeTextInstructions(textInstructionsKey);
+        }
+        return;
+      }
+
+      if (this.buffers_ !== buffersRef) {
+        if (textInstructionsKey) {
+          this.styleRenderer_.disposeTextInstructions(textInstructionsKey);
+        }
+      } else if (textInstructionsKey) {
+        const previousKey = buffersRef.textInstructionsKey;
+        buffersRef.textInstructionsKey = textInstructionsKey;
+        this.queueTextInstructionsDispose_(previousKey);
+        this.getLayer().changed();
+      }
+
+      if (this.textRebuildQueued_) {
+        this.textRebuildQueued_ = false;
+        this.textRebuildNeeded_ = true;
+      }
+    });
+  }
+
+  /**
+   * Throttled render of the text overlay.
+   * @param {import("../../Map.js").FrameState} frameState Frame state.
+   * @private
+   */
+  maybeFinalizeTextRender_(frameState) {
+    if (!this.styleRenderer_) {
+      return;
+    }
+
+    if (this.batch_.isEmpty() || !this.styleRenderer_.hasText()) {
+      this.styleRenderer_.clearTextOverlay();
+      this.lastRenderedTextInstructionsKey_ = null;
+      this.flushPendingTextInstructions_();
+      return;
+    }
+
+    if (!this.buffers_?.textInstructionsKey) {
+      return;
+    }
+
+    const currentTextInstructionsKey = this.buffers_.textInstructionsKey;
+    const keyChanged =
+      currentTextInstructionsKey !== this.lastRenderedTextInstructionsKey_;
+    const now = frameState.time;
+    if (
+      this.textOverlayRenderThrottleMs_ > 0 &&
+      !keyChanged &&
+      now - this.lastTextOverlayRenderTime_ < this.textOverlayRenderThrottleMs_
+    ) {
+      return;
+    }
+    this.lastTextOverlayRenderTime_ = now;
+
+    this.styleRenderer_.finalizeTextRender(frameState).then(() => {
+      if (this.buffers_?.textInstructionsKey === currentTextInstructionsKey) {
+        this.lastRenderedTextInstructionsKey_ = currentTextInstructionsKey;
+        this.flushPendingTextInstructions_();
+      }
+    });
+  }
+
+  /**
+   * Queue text instructions for disposal after the current text render completes.
+   * @param {string|null|undefined} key Text instructions key.
+   * @private
+   */
+  queueTextInstructionsDispose_(key) {
+    if (!key) {
+      return;
+    }
+    this.pendingTextInstructions_.push(key);
+  }
+
+  /**
+   * Flush queued text instruction disposals.
+   * @private
+   */
+  flushPendingTextInstructions_() {
+    if (!this.pendingTextInstructions_.length || !this.styleRenderer_) {
+      return;
+    }
+    for (const key of this.pendingTextInstructions_) {
+      this.styleRenderer_.disposeTextInstructions(key);
+    }
+    this.pendingTextInstructions_.length = 0;
   }
 
   /**
@@ -366,11 +902,14 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       this.getLayer(),
     );
 
+    this.flushPointUpdates_(gl);
+    this.maybeRebuildTextInstructions_(frameState);
+
     // draw the normal canvas
     this.helper.prepareDraw(frameState);
     this.renderWorlds(frameState, false, startWorld, endWorld, worldWidth);
 
-    this.styleRenderer_.finalizeTextRender(frameState);
+    this.maybeFinalizeTextRender_(frameState);
 
     this.helper.finalizeDraw(
       frameState,
@@ -409,13 +948,23 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       !frameState.viewHints[ViewHint.ANIMATING] &&
       !frameState.viewHints[ViewHint.INTERACTING];
     const extentChanged = !equals(this.previousExtent_, frameState.extent);
-    const sourceChanged = this.sourceRevision_ < vectorSource.getRevision();
+    const needsRebuild =
+      viewNotMoving &&
+      (extentChanged || this.rebuildNeeded_ || this.rebuildQueued_);
 
-    if (sourceChanged) {
-      this.sourceRevision_ = vectorSource.getRevision();
-    }
+    if (needsRebuild) {
+      if (this.bufferGenerationInFlight_) {
+        if (!this.rebuildQueued_) {
+          this.bufferGeneration_++;
+          this.rebuildQueued_ = true;
+        }
+        this.rebuildNeeded_ = false;
+        return true;
+      }
 
-    if (viewNotMoving && (extentChanged || sourceChanged)) {
+      this.rebuildQueued_ = false;
+      this.rebuildNeeded_ = false;
+
       const projection = viewState.projection;
       const resolution = viewState.resolution;
 
@@ -436,6 +985,9 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
 
       this.ready = false;
 
+      const generation = ++this.bufferGeneration_;
+      this.bufferGenerationInFlight_ = generation;
+
       const transform = this.helper.makeProjectionTransform(
         frameState,
         createTransform(),
@@ -444,12 +996,42 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       this.styleRenderer_
         .generateBuffers(this.batch_, transform)
         .then((buffers) => {
+          if (generation !== this.bufferGeneration_) {
+            if (buffers) {
+              this.disposeBuffers(buffers);
+            }
+            if (this.bufferGenerationInFlight_ === generation) {
+              this.bufferGenerationInFlight_ = 0;
+            }
+            if (this.rebuildQueued_) {
+              this.getLayer().changed();
+            }
+            return;
+          }
+
+          this.bufferGenerationInFlight_ = 0;
+
           if (this.buffers_) {
             this.disposeBuffers(this.buffers_);
           }
           this.buffers_ = buffers;
+          this.textRebuildGeneration_++;
+          this.textRebuildNeeded_ = false;
+          this.textRebuildQueued_ = false;
+          this.textRebuildInFlight_ = false;
+          if (this.textRebuildTimerId_) {
+            clearTimeout(this.textRebuildTimerId_);
+            this.textRebuildTimerId_ = 0;
+          }
+          setFromTransform(this.renderTransform_, transform);
+          this.rebuildPointInstanceIndex_();
           this.ready = true;
           this.getLayer().changed();
+
+          if (this.rebuildQueued_) {
+            this.rebuildQueued_ = false;
+            this.getLayer().changed();
+          }
         });
 
       this.previousExtent_ = frameState.extent.slice();
@@ -565,7 +1147,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     if (buffers.polygonBuffers) {
       disposeBuffersOfType(buffers.polygonBuffers);
     }
-    this.styleRenderer_.disposeTextInstructions(buffers.textInstructionsKey);
+    this.queueTextInstructionsDispose_(buffers.textInstructionsKey);
   }
 
   /**
@@ -575,6 +1157,11 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   disposeInternal() {
     if (this.buffers_) {
       this.disposeBuffers(this.buffers_);
+    }
+    this.flushPendingTextInstructions_();
+    if (this.textRebuildTimerId_) {
+      clearTimeout(this.textRebuildTimerId_);
+      this.textRebuildTimerId_ = 0;
     }
     if (this.sourceListenKeys_) {
       this.sourceListenKeys_.forEach(function (key) {

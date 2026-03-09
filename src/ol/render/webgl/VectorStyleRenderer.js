@@ -353,6 +353,24 @@ class VectorStyleRenderer extends Disposable {
      */
     this.textOverlayWorker_ = createTextOverlayWorker();
 
+    /**
+     * @type {boolean}
+     * @private
+     */
+    this.textRenderInFlight_ = false;
+
+    /**
+     * @type {Object|null}
+     * @private
+     */
+    this.queuedTextRenderFrameState_ = null;
+
+    /**
+     * @type {{promise: Promise<void>, resolve: function(): void}|null}
+     * @private
+     */
+    this.queuedTextRenderPromise_ = null;
+
     // this will initialize render passes with the given helper
     this.setHelper(helper);
   }
@@ -622,6 +640,7 @@ class VectorStyleRenderer extends Disposable {
         }
 
         // we're getting a key from the worker: these will be used later on to ask for render or disposal
+        textOverlayWorker.removeEventListener('message', handleMessage);
         resolve(received.instructionsSetKey);
       };
 
@@ -738,38 +757,83 @@ class VectorStyleRenderer extends Disposable {
    * @return {Promise<void>} A promise resolving after the post rendering step is over
    */
   finalizeTextRender(frameState) {
+    const serializedFrameState = serializeFrameState(frameState);
+
+    if (this.textRenderInFlight_) {
+      this.queuedTextRenderFrameState_ = serializedFrameState;
+      if (!this.queuedTextRenderPromise_) {
+        /** @type {function(): void} */
+        let resolve;
+        const promise = new Promise((r) => {
+          resolve = r;
+        });
+        this.queuedTextRenderPromise_ = {promise, resolve};
+      }
+      return this.queuedTextRenderPromise_.promise;
+    }
+
+    return this.startTextRender_(serializedFrameState);
+  }
+
+  /**
+   * @param {Object} serializedFrameState Serialized frame state.
+   * @return {Promise<void>} A promise resolving after the post rendering step is over.
+   * @private
+   */
+  startTextRender_(serializedFrameState) {
     const messageId = workerMessageCounter++;
     const textOverlayWorker = this.textOverlayWorker_;
+    this.textRenderInFlight_ = true;
     textOverlayWorker.postMessage({
       type: TextOverlayWorkerMessageType.RENDER,
-      frameState: serializeFrameState(frameState),
+      frameState: serializedFrameState,
       id: messageId,
     });
+
     return new Promise((resolve) => {
-      textOverlayWorker.addEventListener('message', (message) => {
+      /**
+       * @param {{data: import('./constants.js').TextOverlayWorkerMessage}} message Event.
+       */
+      const handleMessage = (message) => {
         const received = message.data;
         // this is not the response to our request: skip
         if (received.id !== messageId) {
           return;
         }
 
-        this.textOverlayRenderFrameState_ = message.data.frameState;
+        textOverlayWorker.removeEventListener('message', handleMessage);
+        this.textRenderInFlight_ = false;
+        this.textOverlayRenderFrameState_ = received.frameState;
 
-        // the rendered image data is copied to the canvas and then given back to the worker
-        const imageData = message.data.imageData;
-        this.textOverlayCanvas_.width = imageData.width;
-        this.textOverlayCanvas_.height = imageData.height;
-        this.textOverlayCanvas_.getContext('2d').drawImage(imageData, 0, 0);
-        this.textOverlayCanvas_.style.transform = message.data.transform;
-        textOverlayWorker.postMessage(
-          {
-            type: TextOverlayWorkerMessageType.GIVE_BACK_CANVAS,
-            imageData,
-          },
-          [imageData],
-        );
+        const imageData = received.imageData;
+        const context = this.textOverlayCanvas_.getContext('2d');
+        if (
+          this.textOverlayCanvas_.width !== imageData.width ||
+          this.textOverlayCanvas_.height !== imageData.height
+        ) {
+          this.textOverlayCanvas_.width = imageData.width;
+          this.textOverlayCanvas_.height = imageData.height;
+        }
+        if (context.globalCompositeOperation !== 'copy') {
+          context.globalCompositeOperation = 'copy';
+        }
+        context.drawImage(imageData, 0, 0);
+
         resolve();
-      });
+        if (this.queuedTextRenderFrameState_) {
+          const nextFrameState = this.queuedTextRenderFrameState_;
+          const queuedPromise = this.queuedTextRenderPromise_;
+          this.queuedTextRenderFrameState_ = null;
+          this.queuedTextRenderPromise_ = null;
+          this.startTextRender_(nextFrameState).then(() => {
+            if (queuedPromise) {
+              queuedPromise.resolve();
+            }
+          });
+        }
+      };
+
+      textOverlayWorker.addEventListener('message', handleMessage);
     });
   }
 

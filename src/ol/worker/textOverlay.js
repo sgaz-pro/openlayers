@@ -26,6 +26,9 @@ import {
 const worker = self;
 
 let textRenderAnimationFrameKey = 0;
+let textRenderInProgress = false;
+const pendingRenders = [];
+let lastNonEmptyRenderBatchKeys = [];
 
 const canvas = new OffscreenCanvas(1, 1);
 const context = canvas.getContext('2d');
@@ -69,6 +72,118 @@ function getRenderTransform(
   return composeTransform(tmpTransform, dx1, dy1, sx, sy, -rotation, dx2, dy2);
 }
 
+function scheduleTextRender() {
+  if (
+    textRenderAnimationFrameKey ||
+    textRenderInProgress ||
+    !pendingRenders.length
+  ) {
+    return;
+  }
+
+  textRenderAnimationFrameKey = requestAnimationFrame(() => {
+    textRenderAnimationFrameKey = 0;
+    textRenderInProgress = true;
+
+    const renderJob = pendingRenders.shift();
+    if (!renderJob) {
+      textRenderInProgress = false;
+      scheduleTextRender();
+      return;
+    }
+
+    const {id, frameState: frameStateSerialized, renderBatchKeys} = renderJob;
+    const frameState = deserializeFrameState(frameStateSerialized);
+    const viewState = frameState.viewState;
+
+    // either resize or clear
+    if (
+      frameState.size[0] !== canvas.width ||
+      frameState.size[1] !== canvas.height
+    ) {
+      canvas.width = frameState.size[0];
+      canvas.height = frameState.size[1];
+    } else {
+      context.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    for (const renderBatchKey of renderBatchKeys) {
+      if (!renderBatches.has(renderBatchKey)) {
+        console.warn('Unknown render batch key ', renderBatchKey); // TODO: this should not happen, maybe throw here?
+        continue;
+      }
+      const renderBatch = renderBatches.get(renderBatchKey);
+      if (!renderBatch) {
+        // no instructions there
+        continue;
+      }
+      const transform = getRenderTransform(
+        viewState.center,
+        viewState.resolution,
+        0,
+        frameState.pixelRatio,
+        canvas.width,
+        canvas.height,
+        0,
+      );
+      multiplyTransform(transform, renderBatch.inverseTransform);
+
+      renderBatch.executor.execute(
+        context,
+        frameState.size,
+        transform,
+        frameState.viewState.rotation,
+        false,
+      );
+    }
+
+    const imageData = canvas.transferToImageBitmap();
+
+    /** @type {import('../render/webgl/constants.js').TextOverlayWorkerMessage} */
+    const message = {
+      type: TextOverlayWorkerMessageType.RENDER,
+      imageData,
+      frameState: frameStateSerialized,
+      id,
+    };
+    worker.postMessage(message, [imageData]);
+
+    textRenderInProgress = false;
+    scheduleTextRender();
+  });
+}
+
+function enqueueTextRender(id, frameStateSerialized) {
+  const snapshotBatchKeys = Array.from(renderBatchList.values());
+  renderBatchList.clear();
+  let renderBatchKeys = snapshotBatchKeys.filter((key) =>
+    renderBatches.has(key),
+  );
+
+  // Reuse the last rendered non-empty batch set when render requests briefly
+  // outrun ADD_TO_RENDER_LIST messages during animation.
+  if (!renderBatchKeys.length && snapshotBatchKeys.length === 0) {
+    renderBatchKeys = lastNonEmptyRenderBatchKeys.filter((key) =>
+      renderBatches.has(key),
+    );
+  }
+  if (renderBatchKeys.length) {
+    lastNonEmptyRenderBatchKeys = renderBatchKeys.slice();
+  }
+
+  const renderJob = {
+    id,
+    frameState: frameStateSerialized,
+    renderBatchKeys,
+  };
+  if (pendingRenders.length) {
+    pendingRenders[pendingRenders.length - 1] = renderJob;
+  } else {
+    pendingRenders.push(renderJob);
+  }
+  scheduleTextRender();
+}
+
 worker.onmessage = (event) => {
   const received = event.data;
   switch (received.type) {
@@ -79,71 +194,7 @@ worker.onmessage = (event) => {
     }
 
     case TextOverlayWorkerMessageType.RENDER: {
-      const frameState = deserializeFrameState(received.frameState);
-      const viewState = frameState.viewState;
-      if (textRenderAnimationFrameKey) {
-        // cancel the ongoing frame, render the new one
-        cancelAnimationFrame(textRenderAnimationFrameKey);
-      }
-      textRenderAnimationFrameKey = requestAnimationFrame(() => {
-        textRenderAnimationFrameKey = 0;
-
-        // either resize or clear
-        if (
-          frameState.size[0] !== canvas.width ||
-          frameState.size[1] !== canvas.height
-        ) {
-          canvas.width = frameState.size[0];
-          canvas.height = frameState.size[1];
-        } else {
-          context.clearRect(0, 0, canvas.width, canvas.height);
-        }
-
-        for (const renderBatchKey of renderBatchList.values()) {
-          if (!renderBatches.has(renderBatchKey)) {
-            console.warn('Unknown render batch key ', renderBatchKey); // TODO: this should not happen, maybe throw here?
-            continue;
-          }
-          const renderBatch = renderBatches.get(renderBatchKey);
-          if (!renderBatch) {
-            // no instructions there
-            continue;
-          }
-          const transform = getRenderTransform(
-            viewState.center,
-            viewState.resolution,
-            0,
-            frameState.pixelRatio,
-            canvas.width,
-            canvas.height,
-            0,
-          );
-          multiplyTransform(transform, renderBatch.inverseTransform);
-
-          renderBatch.executor.execute(
-            context,
-            frameState.size,
-            transform,
-            frameState.viewState.rotation,
-            false,
-          );
-        }
-
-        const imageData = canvas.transferToImageBitmap();
-
-        /** @type {import('../render/webgl/constants.js').TextOverlayWorkerMessage} */
-        const message = {
-          type: TextOverlayWorkerMessageType.RENDER,
-          imageData,
-          frameState: received.frameState,
-          id: received.id,
-        };
-        worker.postMessage(message, [imageData]);
-
-        // clear render list until next frame
-        renderBatchList.clear();
-      });
-
+      enqueueTextRender(received.id, received.frameState);
       break;
     }
 
@@ -241,6 +292,12 @@ worker.onmessage = (event) => {
       const {instructionsSetKey} = received;
       if (renderBatches.has(instructionsSetKey)) {
         renderBatches.delete(instructionsSetKey);
+      }
+      renderBatchList.delete(instructionsSetKey);
+      if (lastNonEmptyRenderBatchKeys.length) {
+        lastNonEmptyRenderBatchKeys = lastNonEmptyRenderBatchKeys.filter(
+          (key) => key !== instructionsSetKey,
+        );
       }
       break;
     }

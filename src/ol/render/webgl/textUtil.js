@@ -79,7 +79,11 @@ export function createPostProcessDefinition(
         vec4 textColor = texture2D(${Uniforms.TEXT_OVERLAY_TEXTURE}, vec2(coords.x, 1. - coords.y));
         textColor.a *= 1. - outOfBounds; // if we're sampling out of the text overlay, make alpha 0 to avoid drawing anything
 
-        gl_FragColor = textColor.a * textColor + (1. - textColor.a) * color;
+        vec3 premultipliedText = textColor.rgb * textColor.a;
+        gl_FragColor = vec4(
+          premultipliedText + (1. - textColor.a) * color.rgb,
+          textColor.a + (1. - textColor.a) * color.a
+        );
       }`,
     uniforms: {
       [Uniforms.TEXT_OVERLAY_TEXTURE]: textOverlayCanvasGetter,

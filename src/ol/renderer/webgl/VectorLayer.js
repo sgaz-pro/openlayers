@@ -47,6 +47,7 @@ export const Uniforms = {
 const DEFAULT_TEXT_REBUILD_THROTTLE_MS = 120;
 const DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS = 48;
 const TEXT_REBUILD_VISIBILITY_PADDING_CLIP = 0.2;
+const TEXT_REBUILD_DRIFT_THRESHOLD_PX = 12;
 
 /**
  * @typedef {import('../../render/webgl/VectorStyleRenderer.js').StyleShaders} StyleShaders
@@ -186,6 +187,20 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
      * @private
      */
     this.pointInstanceStride_ = 0;
+
+    /**
+     * Last point coordinates used to build visible text instructions.
+     * @type {Map<string, Array<number>>}
+     * @private
+     */
+    this.pointTextAnchorByUid_ = new Map();
+
+    /**
+     * Last rendered frame size in CSS pixels.
+     * @type {Array<number>}
+     * @private
+     */
+    this.lastFrameSize_ = [1, 1];
 
     /**
      * Minimum interval between text instruction rebuilds during point animation.
@@ -485,9 +500,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
         this.dirtyPointUids_.add(uid);
         if (
           this.buffers_?.textInstructionsKey &&
-          this.isPointPotentiallyVisibleForText_(
-            pointGeometry.getFlatCoordinates(),
-          )
+          this.shouldRebuildPointText_(uid, pointGeometry.getFlatCoordinates())
         ) {
           this.textRebuildNeeded_ = true;
         }
@@ -510,6 +523,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     this.geometryRevisionByUid_.delete(uid);
     this.dirtyPointUids_.delete(uid);
     this.pointInstanceIndexByUid_.delete(uid);
+    this.pointTextAnchorByUid_.delete(uid);
     this.requestRebuild_();
   }
 
@@ -521,6 +535,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     this.geometryRevisionByUid_.clear();
     this.dirtyPointUids_.clear();
     this.pointInstanceIndexByUid_.clear();
+    this.pointTextAnchorByUid_.clear();
     this.pointInstanceStride_ = 0;
     this.textRebuildNeeded_ = false;
     this.textRebuildQueued_ = false;
@@ -678,14 +693,31 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   }
 
   /**
-   * Check whether a point can contribute to text rendering for the current view.
-   * @param {Array<number>} flatCoordinates Point flat coordinates.
-   * @return {boolean} Whether the point is potentially visible for text rendering.
+   * Capture point anchors for labels from the current batch state.
+   * @return {Map<string, Array<number>>} Point anchors by feature uid.
    * @private
    */
-  isPointPotentiallyVisibleForText_(flatCoordinates) {
+  capturePointTextAnchors_() {
+    const anchors = new Map();
+    const entries = this.batch_.pointBatch.entries;
+    for (const uid in entries) {
+      const coordinates = entries[uid]?.flatCoordss?.[0];
+      if (coordinates?.length >= 2) {
+        anchors.set(uid, [coordinates[0], coordinates[1]]);
+      }
+    }
+    return anchors;
+  }
+
+  /**
+   * Convert point coordinates to clip coordinates using the last render transform.
+   * @param {Array<number>} flatCoordinates Point flat coordinates.
+   * @return {Array<number>|null} Clip coordinates.
+   * @private
+   */
+  getClipCoordinates_(flatCoordinates) {
     if (!flatCoordinates || flatCoordinates.length < 2) {
-      return false;
+      return null;
     }
     const transform = this.renderTransform_;
     const clipX =
@@ -697,11 +729,86 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       transform[3] * flatCoordinates[1] +
       transform[5];
     if (!Number.isFinite(clipX) || !Number.isFinite(clipY)) {
+      return null;
+    }
+    return [clipX, clipY];
+  }
+
+  /**
+   * Compute screen-space drift between two point anchors.
+   * @param {Array<number>} previousCoordinates Previous point coordinates.
+   * @param {Array<number>} currentCoordinates Current point coordinates.
+   * @return {number} Drift in CSS pixels.
+   * @private
+   */
+  getPointTextDriftPx_(previousCoordinates, currentCoordinates) {
+    const previousClipCoordinates = this.getClipCoordinates_(previousCoordinates);
+    const currentClipCoordinates = this.getClipCoordinates_(currentCoordinates);
+    if (!previousClipCoordinates || !currentClipCoordinates) {
+      return Infinity;
+    }
+    const width = Math.max(this.lastFrameSize_[0], 1);
+    const height = Math.max(this.lastFrameSize_[1], 1);
+    const driftX =
+      Math.abs(currentClipCoordinates[0] - previousClipCoordinates[0]) *
+      0.5 *
+      width;
+    const driftY =
+      Math.abs(currentClipCoordinates[1] - previousClipCoordinates[1]) *
+      0.5 *
+      height;
+    return Math.max(driftX, driftY);
+  }
+
+  /**
+   * Check whether a point text rebuild is needed for a moved point feature.
+   * @param {string} uid Feature uid.
+   * @param {Array<number>} flatCoordinates Current point coordinates.
+   * @return {boolean} Whether text instructions should be rebuilt.
+   * @private
+   */
+  shouldRebuildPointText_(uid, flatCoordinates) {
+    const previousCoordinates = this.pointTextAnchorByUid_.get(uid);
+    const currentVisible = this.isPointPotentiallyVisibleForText_(flatCoordinates);
+    if (!previousCoordinates) {
+      return currentVisible;
+    }
+    const previousVisible =
+      this.isPointPotentiallyVisibleForText_(previousCoordinates);
+    if (!currentVisible && !previousVisible) {
+      return false;
+    }
+    if (currentVisible !== previousVisible) {
+      return true;
+    }
+    return (
+      this.getPointTextDriftPx_(previousCoordinates, flatCoordinates) >=
+      TEXT_REBUILD_DRIFT_THRESHOLD_PX
+    );
+  }
+
+  /**
+   * Check whether a point can contribute to text rendering for the current view.
+   * @param {Array<number>} flatCoordinates Point flat coordinates.
+   * @return {boolean} Whether the point is potentially visible for text rendering.
+   * @private
+   */
+  isPointPotentiallyVisibleForText_(flatCoordinates) {
+    if (!flatCoordinates || flatCoordinates.length < 2) {
+      return false;
+    }
+    const clipCoordinates = this.getClipCoordinates_(flatCoordinates);
+    if (!clipCoordinates) {
       return true;
     }
     const min = -1 - TEXT_REBUILD_VISIBILITY_PADDING_CLIP;
     const max = 1 + TEXT_REBUILD_VISIBILITY_PADDING_CLIP;
-    return clipX >= min && clipX <= max && clipY >= min && clipY <= max;
+    return (
+      clipCoordinates[0] >= min &&
+      clipCoordinates[0] <= max &&
+      clipCoordinates[1] >= min &&
+      clipCoordinates[1] <= max
+    );
   }
 
   /**
@@ -750,6 +857,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
 
     const generation = ++this.textRebuildGeneration_;
     const buffersRef = this.buffers_;
+    const pointTextAnchorsSnapshot = this.capturePointTextAnchors_();
     const transform = this.helper.makeProjectionTransform(
       frameState,
       createTransform(),
@@ -781,6 +889,9 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
         const previousKey = buffersRef.textInstructionsKey;
         buffersRef.textInstructionsKey = textInstructionsKey;
         this.queueTextInstructionsDispose_(previousKey);
+        if (!this.textRebuildQueued_) {
+          this.pointTextAnchorByUid_ = pointTextAnchorsSnapshot;
+        }
         this.getLayer().changed();
       }
 
@@ -895,6 +1006,8 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
    */
   renderFrame(frameState) {
     const gl = this.helper.getGL();
+    this.lastFrameSize_[0] = frameState.size[0];
+    this.lastFrameSize_[1] = frameState.size[1];
     this.preRender(gl, frameState);
 
     const [startWorld, endWorld, worldWidth] = getWorldParameters(
@@ -1025,6 +1138,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
           }
           setFromTransform(this.renderTransform_, transform);
           this.rebuildPointInstanceIndex_();
+          this.pointTextAnchorByUid_ = this.capturePointTextAnchors_();
           this.ready = true;
           this.getLayer().changed();
 

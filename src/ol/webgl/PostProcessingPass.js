@@ -45,6 +45,7 @@ const DEFAULT_FRAGMENT_SHADER = `
 
 /**
  * @typedef {Object} UniformInternalDescription
+ * @property {string} name Uniform name
  * @property {import("./Helper").UniformValue} value Value
  * @property {WebGLUniformLocation} location Location
  * @property {WebGLTexture} [texture] Texture
@@ -214,6 +215,7 @@ class WebGLPostProcessingPass {
     options.uniforms &&
       Object.keys(options.uniforms).forEach((name) => {
         this.uniforms_.push({
+          name,
           value: options.uniforms[name],
           location: gl.getUniformLocation(this.renderTargetProgram_, name),
         });
@@ -410,9 +412,12 @@ class WebGLPostProcessingPass {
         if (!uniform.texture) {
           uniform.texture = gl.createTexture();
         }
+        const useNearestFiltering = uniform.name === 'u_textOverlay';
+        const filter = useNearestFiltering ? gl.NEAREST : gl.LINEAR;
         gl.activeTexture(gl[`TEXTURE${textureSlot}`]);
         gl.bindTexture(gl.TEXTURE_2D, uniform.texture);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 

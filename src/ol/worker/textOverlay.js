@@ -28,7 +28,7 @@ const worker = self;
 let textRenderAnimationFrameKey = 0;
 let textRenderInProgress = false;
 const pendingRenders = [];
-let lastNonEmptyRenderBatchKeys = [];
+let lastRenderedRenderBatchKey = null;
 
 const canvas = new OffscreenCanvas(1, 1);
 const context = canvas.getContext('2d');
@@ -47,10 +47,10 @@ const context = canvas.getContext('2d');
 const renderBatches = new Map();
 
 /**
- * This holds the ids of the render batches to render in the next frame; will be cleared after each frame
- * @type {Set<string>}
+ * Current render batch key requested by the main thread.
+ * @type {string|null}
  */
-const renderBatchList = new Set();
+let activeRenderBatchKey = null;
 
 const tmpTransform = createTransform();
 
@@ -92,7 +92,7 @@ function scheduleTextRender() {
       return;
     }
 
-    const {id, frameState: frameStateSerialized, renderBatchKeys} = renderJob;
+    const {id, frameState: frameStateSerialized, renderBatchKey} = renderJob;
     const frameState = deserializeFrameState(frameStateSerialized);
     const viewState = frameState.viewState;
 
@@ -107,34 +107,32 @@ function scheduleTextRender() {
       context.clearRect(0, 0, canvas.width, canvas.height);
     }
 
-    for (const renderBatchKey of renderBatchKeys) {
+    if (renderBatchKey) {
       if (!renderBatches.has(renderBatchKey)) {
         console.warn('Unknown render batch key ', renderBatchKey); // TODO: this should not happen, maybe throw here?
-        continue;
-      }
-      const renderBatch = renderBatches.get(renderBatchKey);
-      if (!renderBatch) {
-        // no instructions there
-        continue;
-      }
-      const transform = getRenderTransform(
-        viewState.center,
-        viewState.resolution,
-        0,
-        frameState.pixelRatio,
-        canvas.width,
-        canvas.height,
-        0,
-      );
-      multiplyTransform(transform, renderBatch.inverseTransform);
+      } else {
+        const renderBatch = renderBatches.get(renderBatchKey);
+        if (renderBatch) {
+          const transform = getRenderTransform(
+            viewState.center,
+            viewState.resolution,
+            0,
+            frameState.pixelRatio,
+            canvas.width,
+            canvas.height,
+            0,
+          );
+          multiplyTransform(transform, renderBatch.inverseTransform);
 
-      renderBatch.executor.execute(
-        context,
-        frameState.size,
-        transform,
-        frameState.viewState.rotation,
-        false,
-      );
+          renderBatch.executor.execute(
+            context,
+            frameState.size,
+            transform,
+            frameState.viewState.rotation,
+            false,
+          );
+        }
+      }
     }
 
     const imageData = canvas.transferToImageBitmap();
@@ -154,27 +152,28 @@ function scheduleTextRender() {
 }
 
 function enqueueTextRender(id, frameStateSerialized) {
-  const snapshotBatchKeys = Array.from(renderBatchList.values());
-  renderBatchList.clear();
-  let renderBatchKeys = snapshotBatchKeys.filter((key) =>
-    renderBatches.has(key),
-  );
+  let renderBatchKeyToRender =
+    activeRenderBatchKey && renderBatches.has(activeRenderBatchKey)
+      ? activeRenderBatchKey
+      : null;
 
-  // Reuse the last rendered non-empty batch set when render requests briefly
-  // outrun ADD_TO_RENDER_LIST messages during animation.
-  if (!renderBatchKeys.length && snapshotBatchKeys.length === 0) {
-    renderBatchKeys = lastNonEmptyRenderBatchKeys.filter((key) =>
-      renderBatches.has(key),
-    );
+  // Reuse the last rendered batch when render requests briefly outrun
+  // SET_RENDER_BATCH messages during animation.
+  if (!renderBatchKeyToRender) {
+    renderBatchKeyToRender =
+      lastRenderedRenderBatchKey &&
+      renderBatches.has(lastRenderedRenderBatchKey)
+        ? lastRenderedRenderBatchKey
+        : null;
   }
-  if (renderBatchKeys.length) {
-    lastNonEmptyRenderBatchKeys = renderBatchKeys.slice();
+  if (renderBatchKeyToRender) {
+    lastRenderedRenderBatchKey = renderBatchKeyToRender;
   }
 
   const renderJob = {
     id,
     frameState: frameStateSerialized,
-    renderBatchKeys,
+    renderBatchKey: renderBatchKeyToRender,
   };
   if (pendingRenders.length) {
     pendingRenders[pendingRenders.length - 1] = renderJob;
@@ -187,9 +186,9 @@ function enqueueTextRender(id, frameStateSerialized) {
 worker.onmessage = (event) => {
   const received = event.data;
   switch (received.type) {
-    case TextOverlayWorkerMessageType.ADD_TO_RENDER_LIST: {
+    case TextOverlayWorkerMessageType.SET_RENDER_BATCH: {
       const {instructionsSetKey} = received;
-      renderBatchList.add(instructionsSetKey);
+      activeRenderBatchKey = instructionsSetKey;
       break;
     }
 
@@ -293,11 +292,11 @@ worker.onmessage = (event) => {
       if (renderBatches.has(instructionsSetKey)) {
         renderBatches.delete(instructionsSetKey);
       }
-      renderBatchList.delete(instructionsSetKey);
-      if (lastNonEmptyRenderBatchKeys.length) {
-        lastNonEmptyRenderBatchKeys = lastNonEmptyRenderBatchKeys.filter(
-          (key) => key !== instructionsSetKey,
-        );
+      if (activeRenderBatchKey === instructionsSetKey) {
+        activeRenderBatchKey = null;
+      }
+      if (lastRenderedRenderBatchKey === instructionsSetKey) {
+        lastRenderedRenderBatchKey = null;
       }
       break;
     }

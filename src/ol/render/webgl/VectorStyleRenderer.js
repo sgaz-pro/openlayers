@@ -775,7 +775,7 @@ class VectorStyleRenderer extends Disposable {
   renderText_(buffers) {
     const textOverlayWorker = this.textOverlayWorker_;
     textOverlayWorker.postMessage({
-      type: TextOverlayWorkerMessageType.ADD_TO_RENDER_LIST,
+      type: TextOverlayWorkerMessageType.SET_RENDER_BATCH,
       instructionsSetKey: buffers.textInstructionsKey,
     });
   }

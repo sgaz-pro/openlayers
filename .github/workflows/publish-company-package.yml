@@ -1,0 +1,96 @@
+name: Publish Company Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version. Leave empty to generate 10.8.1-webgl-text-animation.<timestamp>.'
+        required: false
+        type: string
+      npm-tag:
+        description: 'npm dist-tag for manual publishes'
+        required: true
+        default: dev
+        type: string
+      npm-access:
+        description: 'npm access level for the scoped package'
+        required: true
+        default: restricted
+        type: choice
+        options:
+          - restricted
+          - public
+  push:
+    tags:
+      - 'sgaz-openlayers/v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish-manual:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install dependencies
+        run: npm ci
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            node tasks/company-package-version.js validate "${VERSION}" >/dev/null
+          else
+            VERSION=$(node tasks/company-package-version.js next)
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+      - name: Build company package
+        run: npm run build-company-package
+        env:
+          OL_PACKAGE_NAME: '@sgaz-pro/openlayers'
+          OL_PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          OL_PACKAGE_REPOSITORY_URL: 'git+https://github.com/sgaz-pro/openlayers.git'
+          OL_PACKAGE_HOMEPAGE: 'https://github.com/sgaz-pro/openlayers'
+          OL_PACKAGE_BUGS_URL: 'https://github.com/sgaz-pro/openlayers/issues'
+      - name: Publish
+        run: |
+          cd build/ol
+          npm publish --tag "${{ inputs.npm-tag }}" --access "${{ inputs.npm-access }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-tag:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install dependencies
+        run: npm ci
+      - name: Resolve version from company tag
+        id: version
+        run: |
+          VERSION=$(node tasks/company-package-version.js from-tag "${GITHUB_REF_NAME}")
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+      - name: Build company package
+        run: npm run build-company-package
+        env:
+          OL_PACKAGE_NAME: '@sgaz-pro/openlayers'
+          OL_PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          OL_PACKAGE_REPOSITORY_URL: 'git+https://github.com/sgaz-pro/openlayers.git'
+          OL_PACKAGE_HOMEPAGE: 'https://github.com/sgaz-pro/openlayers'
+          OL_PACKAGE_BUGS_URL: 'https://github.com/sgaz-pro/openlayers/issues'
+      - name: Publish
+        run: |
+          cd build/ol
+          npm publish --tag latest --access restricted
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

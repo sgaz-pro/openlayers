@@ -8,8 +8,35 @@ const buildDir = path.resolve(baseDir, '../build/ol');
 
 async function main() {
   const pkg = await fse.readJSON(path.resolve(baseDir, '../package.json'));
+  const packageName = process.env.OL_PACKAGE_NAME;
+  const packageVersion = process.env.OL_PACKAGE_VERSION;
+  const packageRepositoryUrl = process.env.OL_PACKAGE_REPOSITORY_URL;
+  const packageHomepage = process.env.OL_PACKAGE_HOMEPAGE;
+  const packageBugsUrl = process.env.OL_PACKAGE_BUGS_URL;
 
   // write out simplified package.json
+  if (packageName) {
+    pkg.name = packageName;
+  }
+  if (packageVersion) {
+    pkg.version = packageVersion;
+  }
+  if (packageRepositoryUrl) {
+    pkg.repository = {
+      ...(pkg.repository || {}),
+      type: 'git',
+      url: packageRepositoryUrl,
+    };
+  }
+  if (packageHomepage) {
+    pkg.homepage = packageHomepage;
+  }
+  if (packageBugsUrl) {
+    pkg.bugs = {
+      ...(pkg.bugs || {}),
+      url: packageBugsUrl,
+    };
+  }
   pkg.main = 'index.js';
   delete pkg.scripts;
   delete pkg.devDependencies;
